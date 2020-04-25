@@ -3,6 +3,7 @@ package api
 import (
 	"net/http"
 
+	"github.com/pingcap/pd/v4/server"
 	"github.com/unrolled/render"
 )
 
@@ -20,9 +21,13 @@ func newVersionHandler(rd *render.Render) *versionHandler {
 	}
 }
 
+// @Summary Get the version of PD server.
+// @Produce json
+// @Success 200 {object} version
+// @Router /version [get]
 func (h *versionHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	version := &version{
-		Version: "1.0.0",
+		Version: server.PDReleaseVersion,
 	}
 	h.rd.JSON(w, http.StatusOK, version)
 }

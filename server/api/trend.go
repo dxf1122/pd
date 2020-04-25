@@ -18,10 +18,9 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/juju/errors"
-	"github.com/pingcap/pd/pkg/typeutil"
-	"github.com/pingcap/pd/server"
-	"github.com/pingcap/pd/server/core"
+	"github.com/pingcap/pd/v4/pkg/typeutil"
+	"github.com/pingcap/pd/v4/server"
+	"github.com/pingcap/pd/v4/server/statistics"
 	"github.com/unrolled/render"
 )
 
@@ -43,10 +42,10 @@ type trendStore struct {
 	LastHeartbeatTS *time.Time         `json:"last_heartbeat_ts,omitempty"`
 	Uptime          *typeutil.Duration `json:"uptime,omitempty"`
 
-	HotWriteFlow        uint64   `json:"hot_write_flow"`
-	HotWriteRegionFlows []uint64 `json:"hot_write_region_flows"`
-	HotReadFlow         uint64   `json:"hot_read_flow"`
-	HotReadRegionFlows  []uint64 `json:"hot_read_region_flows"`
+	HotWriteFlow        float64   `json:"hot_write_flow"`
+	HotWriteRegionFlows []float64 `json:"hot_write_region_flows"`
+	HotReadFlow         float64   `json:"hot_read_flow"`
+	HotReadRegionFlows  []float64 `json:"hot_read_region_flows"`
 }
 
 type trendHistory struct {
@@ -76,6 +75,14 @@ func newTrendHandler(s *server.Server, rd *render.Render) *trendHandler {
 	}
 }
 
+// @Tags trend
+// @Summary Get the growth and changes of data in the most recent period of time.
+// @Param from query integer false "From Unix timestamp"
+// @Produce json
+// @Success 200 {object} Trend
+// @Failure 400 {string} string "The request is invalid."
+// @Failure 500 {string} string "PD server failed to proceed the request."
+// @Router /trend [get]
 func (h *trendHandler) Handle(w http.ResponseWriter, r *http.Request) {
 	var from time.Time
 	if fromStr := r.URL.Query()["from"]; len(fromStr) > 0 {
@@ -107,9 +114,7 @@ func (h *trendHandler) Handle(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *trendHandler) getTrendStores() ([]trendStore, error) {
-	maxStoreDownTime := h.svr.GetScheduleConfig().MaxStoreDownTime.Duration
-
-	var readStats, writeStats core.StoreHotRegionsStat
+	var readStats, writeStats statistics.StoreHotPeersStat
 	if hotRead := h.GetHotReadRegions(); hotRead != nil {
 		readStats = hotRead.AsLeader
 	}
@@ -118,12 +123,12 @@ func (h *trendHandler) getTrendStores() ([]trendStore, error) {
 	}
 	stores, err := h.GetStores()
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, err
 	}
 
 	trendStores := make([]trendStore, 0, len(stores))
 	for _, store := range stores {
-		info := newStoreInfo(store, maxStoreDownTime)
+		info := newStoreInfo(h.svr.GetScheduleConfig(), store)
 		s := trendStore{
 			ID:              info.Store.GetId(),
 			Address:         info.Store.GetAddress(),
@@ -136,21 +141,21 @@ func (h *trendHandler) getTrendStores() ([]trendStore, error) {
 			LastHeartbeatTS: info.Status.LastHeartbeatTS,
 			Uptime:          info.Status.Uptime,
 		}
-		s.HotReadFlow, s.HotReadRegionFlows = h.getStoreFlow(readStats, store.GetId())
-		s.HotWriteFlow, s.HotWriteRegionFlows = h.getStoreFlow(writeStats, store.GetId())
+		s.HotReadFlow, s.HotReadRegionFlows = h.getStoreFlow(readStats, store.GetID())
+		s.HotWriteFlow, s.HotWriteRegionFlows = h.getStoreFlow(writeStats, store.GetID())
 		trendStores = append(trendStores, s)
 	}
 	return trendStores, nil
 }
 
-func (h *trendHandler) getStoreFlow(stats core.StoreHotRegionsStat, storeID uint64) (storeFlow uint64, regionFlows []uint64) {
+func (h *trendHandler) getStoreFlow(stats statistics.StoreHotPeersStat, storeID uint64) (storeFlow float64, regionFlows []float64) {
 	if stats == nil {
 		return
 	}
 	if stat, ok := stats[storeID]; ok {
-		storeFlow = stat.TotalFlowBytes
-		for _, flow := range stat.RegionsStat {
-			regionFlows = append(regionFlows, flow.FlowBytes)
+		storeFlow = stat.TotalBytesRate
+		for _, flow := range stat.Stats {
+			regionFlows = append(regionFlows, flow.GetByteRate())
 		}
 	}
 	return
@@ -159,7 +164,7 @@ func (h *trendHandler) getStoreFlow(stats core.StoreHotRegionsStat, storeID uint
 func (h *trendHandler) getTrendHistory(start time.Time) (*trendHistory, error) {
 	operatorHistory, err := h.GetHistory(start)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, err
 	}
 	// Use a tmp map to merge same histories together.
 	historyMap := make(map[trendHistoryEntry]int)

@@ -16,7 +16,7 @@ package api
 import (
 	"net/http"
 
-	"github.com/pingcap/pd/server"
+	"github.com/pingcap/pd/v4/server"
 	"github.com/unrolled/render"
 )
 
@@ -25,9 +25,12 @@ type hotStatusHandler struct {
 	rd *render.Render
 }
 
-type hotStoreStats struct {
-	WriteStats map[uint64]uint64 `json:"write,omitempty"`
-	ReadStats  map[uint64]uint64 `json:"read,omitempty"`
+// HotStoreStats is used to record the status of hot stores.
+type HotStoreStats struct {
+	BytesWriteStats map[uint64]float64 `json:"bytes-write-rate,omitempty"`
+	BytesReadStats  map[uint64]float64 `json:"bytes-read-rate,omitempty"`
+	KeysWriteStats  map[uint64]float64 `json:"keys-write-rate,omitempty"`
+	KeysReadStats   map[uint64]float64 `json:"keys-read-rate,omitempty"`
 }
 
 func newHotStatusHandler(handler *server.Handler, rd *render.Render) *hotStatusHandler {
@@ -37,20 +40,40 @@ func newHotStatusHandler(handler *server.Handler, rd *render.Render) *hotStatusH
 	}
 }
 
+// @Tags hotspot
+// @Summary List the hot write regions.
+// @Produce json
+// @Success 200 {object} statistics.StoreHotPeersInfos
+// @Router /hotspot/regions/write [get]
 func (h *hotStatusHandler) GetHotWriteRegions(w http.ResponseWriter, r *http.Request) {
 	h.rd.JSON(w, http.StatusOK, h.Handler.GetHotWriteRegions())
 }
 
+// @Tags hotspot
+// @Summary List the hot read regions.
+// @Produce json
+// @Success 200 {object} statistics.StoreHotPeersInfos
+// @Router /hotspot/regions/read [get]
 func (h *hotStatusHandler) GetHotReadRegions(w http.ResponseWriter, r *http.Request) {
 	h.rd.JSON(w, http.StatusOK, h.Handler.GetHotReadRegions())
 }
 
+// @Tags hotspot
+// @Summary List the hot stores.
+// @Produce json
+// @Success 200 {object} HotStoreStats
+// @Router /hotspot/stores [get]
 func (h *hotStatusHandler) GetHotStores(w http.ResponseWriter, r *http.Request) {
-	readStats := h.GetHotReadStores()
-	writeStats := h.GetHotWriteStores()
-	stats := hotStoreStats{
-		WriteStats: writeStats,
-		ReadStats:  readStats,
+	bytesWriteStats := h.GetHotBytesWriteStores()
+	bytesReadStats := h.GetHotBytesReadStores()
+	keysWriteStats := h.GetHotKeysWriteStores()
+	keysReadStats := h.GetHotKeysReadStores()
+
+	stats := HotStoreStats{
+		BytesWriteStats: bytesWriteStats,
+		BytesReadStats:  bytesReadStats,
+		KeysWriteStats:  keysWriteStats,
+		KeysReadStats:   keysReadStats,
 	}
 	h.rd.JSON(w, http.StatusOK, stats)
 }

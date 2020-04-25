@@ -16,7 +16,7 @@ package api
 import (
 	"net/http"
 
-	"github.com/pingcap/pd/server"
+	"github.com/pingcap/pd/v4/server"
 	"github.com/unrolled/render"
 )
 
@@ -32,10 +32,21 @@ func newClusterHandler(svr *server.Server, rd *render.Render) *clusterHandler {
 	}
 }
 
+// @Tags cluster
+// @Summary Get cluster info.
+// @Produce json
+// @Success 200 {object} metapb.Cluster
+// @Router /cluster [get]
 func (h *clusterHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.rd.JSON(w, http.StatusOK, h.svr.GetCluster())
 }
 
+// @Tags cluster
+// @Summary Get cluster status.
+// @Produce json
+// @Success 200 {object} cluster.Status
+// @Failure 500 {string} string "PD server failed to proceed the request."
+// @Router /cluster/status [get]
 func (h *clusterHandler) GetClusterStatus(w http.ResponseWriter, r *http.Request) {
 	status, err := h.svr.GetClusterStatus()
 	if err != nil {

@@ -14,45 +14,67 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"os"
 	"os/signal"
 	"syscall"
 
-	"github.com/grpc-ecosystem/go-grpc-prometheus"
-	"github.com/juju/errors"
-	"github.com/pingcap/pd/pkg/logutil"
-	"github.com/pingcap/pd/pkg/metricutil"
-	"github.com/pingcap/pd/server"
-	"github.com/pingcap/pd/server/api"
-	log "github.com/sirupsen/logrus"
+	grpcprometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
+	"github.com/pingcap/log"
+	"github.com/pingcap/pd/v4/pkg/dashboard"
+	"github.com/pingcap/pd/v4/pkg/logutil"
+	"github.com/pingcap/pd/v4/pkg/metricutil"
+	"github.com/pingcap/pd/v4/pkg/swaggerserver"
+	"github.com/pingcap/pd/v4/server"
+	"github.com/pingcap/pd/v4/server/api"
+	"github.com/pingcap/pd/v4/server/config"
+	"github.com/pingcap/pd/v4/server/join"
+	"github.com/pkg/errors"
+	"go.uber.org/zap"
 
 	// Register schedulers.
-	_ "github.com/pingcap/pd/server/schedulers"
-	// Register namespace classifiers.
-	_ "github.com/pingcap/pd/table"
+	_ "github.com/pingcap/pd/v4/server/schedulers"
 )
 
 func main() {
-	cfg := server.NewConfig()
+	cfg := config.NewConfig()
 	err := cfg.Parse(os.Args[1:])
 
 	if cfg.Version {
 		server.PrintPDInfo()
-		os.Exit(0)
+		exit(0)
 	}
+
+	defer logutil.LogPanic()
 
 	switch errors.Cause(err) {
 	case nil:
 	case flag.ErrHelp:
-		os.Exit(0)
+		exit(0)
 	default:
-		log.Fatalf("parse cmd flags error: %s\n", err)
+		log.Fatal("parse cmd flags error", zap.Error(err))
 	}
 
+	if cfg.ConfigCheck {
+		server.PrintConfigCheckMsg(cfg)
+		exit(0)
+	}
+
+	// New zap logger
+	err = cfg.SetupLogger()
+	if err == nil {
+		log.ReplaceGlobals(cfg.GetZapLogger(), cfg.GetZapLogProperties())
+	} else {
+		log.Fatal("initialize logger error", zap.Error(err))
+	}
+	// Flushing any buffered log entries
+	defer log.Sync()
+
+	// The old logger
 	err = logutil.InitLogger(&cfg.Log)
 	if err != nil {
-		log.Fatalf("initalize logger error: %s\n", err)
+		log.Fatal("initialize logger error", zap.Error(err))
 	}
 
 	server.LogPDInfo()
@@ -62,17 +84,22 @@ func main() {
 	}
 
 	// TODO: Make it configurable if it has big impact on performance.
-	grpc_prometheus.EnableHandlingTimeHistogram()
+	grpcprometheus.EnableHandlingTimeHistogram()
 
 	metricutil.Push(&cfg.Metric)
 
-	err = server.PrepareJoinCluster(cfg)
+	err = join.PrepareJoinCluster(cfg)
 	if err != nil {
-		log.Fatal("join error ", err)
+		log.Fatal("join meet error", zap.Error(err))
 	}
-	svr, err := server.CreateServer(cfg, api.NewHandler)
+
+	// Creates server.
+	ctx, cancel := context.WithCancel(context.Background())
+	serviceBuilders := []server.HandlerBuilder{api.NewHandler, swaggerserver.NewHandler}
+	serviceBuilders = append(serviceBuilders, dashboard.GetServiceBuilders()...)
+	svr, err := server.CreateServer(ctx, cfg, serviceBuilders...)
 	if err != nil {
-		log.Fatalf("create server failed: %v", errors.Trace(err))
+		log.Fatal("create server failed", zap.Error(err))
 	}
 
 	sc := make(chan os.Signal, 1)
@@ -82,18 +109,29 @@ func main() {
 		syscall.SIGTERM,
 		syscall.SIGQUIT)
 
+	var sig os.Signal
+	go func() {
+		sig = <-sc
+		cancel()
+	}()
+
 	if err := svr.Run(); err != nil {
-		log.Fatalf("run server failed: %v", err)
+		log.Fatal("run server failed", zap.Error(err))
 	}
 
-	sig := <-sc
-	log.Infof("Got signal [%d] to exit.", sig)
+	<-ctx.Done()
+	log.Info("Got signal to exit", zap.String("signal", sig.String()))
 
 	svr.Close()
 	switch sig {
 	case syscall.SIGTERM:
-		os.Exit(0)
+		exit(0)
 	default:
-		os.Exit(1)
+		exit(1)
 	}
+}
+
+func exit(code int) {
+	log.Sync()
+	os.Exit(code)
 }

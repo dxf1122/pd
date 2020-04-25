@@ -14,114 +14,238 @@
 package schedulers
 
 import (
-	"time"
+	"sort"
+	"strconv"
 
 	"github.com/pingcap/kvproto/pkg/metapb"
-	"github.com/pingcap/pd/server/cache"
-	"github.com/pingcap/pd/server/core"
-	"github.com/pingcap/pd/server/schedule"
+	"github.com/pingcap/log"
+	"github.com/pingcap/pd/v4/server/core"
+	"github.com/pingcap/pd/v4/server/schedule"
+	"github.com/pingcap/pd/v4/server/schedule/checker"
+	"github.com/pingcap/pd/v4/server/schedule/filter"
+	"github.com/pingcap/pd/v4/server/schedule/operator"
+	"github.com/pingcap/pd/v4/server/schedule/opt"
+	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"go.uber.org/zap"
 )
 
 func init() {
-	schedule.RegisterScheduler("balance-region", func(limiter *schedule.Limiter, args []string) (schedule.Scheduler, error) {
-		return newBalanceRegionScheduler(limiter), nil
+	schedule.RegisterSliceDecoderBuilder(BalanceRegionType, func(args []string) schedule.ConfigDecoder {
+		return func(v interface{}) error {
+			conf, ok := v.(*balanceRegionSchedulerConfig)
+			if !ok {
+				return ErrScheduleConfigNotExist
+			}
+			ranges, err := getKeyRanges(args)
+			if err != nil {
+				return errors.WithStack(err)
+			}
+			conf.Ranges = ranges
+			conf.Name = BalanceRegionName
+			return nil
+		}
+	})
+	schedule.RegisterScheduler(BalanceRegionType, func(opController *schedule.OperatorController, storage *core.Storage, decoder schedule.ConfigDecoder) (schedule.Scheduler, error) {
+		conf := &balanceRegionSchedulerConfig{}
+		if err := decoder(conf); err != nil {
+			return nil, err
+		}
+		return newBalanceRegionScheduler(opController, conf), nil
 	})
 }
 
-const storeCacheInterval = 30 * time.Second
+const (
+	// balanceRegionRetryLimit is the limit to retry schedule for selected store.
+	balanceRegionRetryLimit = 10
+	// BalanceRegionName is balance region scheduler name.
+	BalanceRegionName = "balance-region-scheduler"
+	// BalanceRegionType is balance region scheduler type.
+	BalanceRegionType = "balance-region"
+)
+
+type balanceRegionSchedulerConfig struct {
+	Name   string          `json:"name"`
+	Ranges []core.KeyRange `json:"ranges"`
+}
 
 type balanceRegionScheduler struct {
-	*baseScheduler
-	cache    *cache.TTLUint64
-	limit    uint64
-	selector schedule.Selector
+	*BaseScheduler
+	conf         *balanceRegionSchedulerConfig
+	opController *schedule.OperatorController
+	filters      []filter.Filter
+	counter      *prometheus.CounterVec
 }
 
 // newBalanceRegionScheduler creates a scheduler that tends to keep regions on
 // each store balanced.
-func newBalanceRegionScheduler(limiter *schedule.Limiter) schedule.Scheduler {
-	ttlCache := cache.NewIDTTL(storeCacheInterval, 4*storeCacheInterval)
-	filters := []schedule.Filter{
-		schedule.NewCacheFilter(ttlCache),
-		schedule.NewStateFilter(),
-		schedule.NewHealthFilter(),
-		schedule.NewSnapshotCountFilter(),
-		schedule.NewStorageThresholdFilter(),
-		schedule.NewPendingPeerCountFilter(),
+func newBalanceRegionScheduler(opController *schedule.OperatorController, conf *balanceRegionSchedulerConfig, opts ...BalanceRegionCreateOption) schedule.Scheduler {
+	base := NewBaseScheduler(opController)
+	scheduler := &balanceRegionScheduler{
+		BaseScheduler: base,
+		conf:          conf,
+		opController:  opController,
+		counter:       balanceRegionCounter,
 	}
-	base := newBaseScheduler(limiter)
-	return &balanceRegionScheduler{
-		baseScheduler: base,
-		cache:         ttlCache,
-		limit:         1,
-		selector:      schedule.NewBalanceSelector(core.RegionKind, filters),
+	for _, setOption := range opts {
+		setOption(scheduler)
+	}
+	scheduler.filters = []filter.Filter{
+		filter.StoreStateFilter{ActionScope: scheduler.GetName(), MoveRegion: true},
+		filter.NewSpecialUseFilter(scheduler.GetName()),
+	}
+	return scheduler
+}
+
+// BalanceRegionCreateOption is used to create a scheduler with an option.
+type BalanceRegionCreateOption func(s *balanceRegionScheduler)
+
+// WithBalanceRegionCounter sets the counter for the scheduler.
+func WithBalanceRegionCounter(counter *prometheus.CounterVec) BalanceRegionCreateOption {
+	return func(s *balanceRegionScheduler) {
+		s.counter = counter
+	}
+}
+
+// WithBalanceRegionName sets the name for the scheduler.
+func WithBalanceRegionName(name string) BalanceRegionCreateOption {
+	return func(s *balanceRegionScheduler) {
+		s.conf.Name = name
 	}
 }
 
 func (s *balanceRegionScheduler) GetName() string {
-	return "balance-region-scheduler"
+	return s.conf.Name
 }
 
 func (s *balanceRegionScheduler) GetType() string {
-	return "balance-region"
+	return BalanceRegionType
 }
 
-func (s *balanceRegionScheduler) IsScheduleAllowed(cluster schedule.Cluster) bool {
-	limit := minUint64(s.limit, cluster.GetRegionScheduleLimit())
-	return s.limiter.OperatorCount(schedule.OpRegion) < limit
+func (s *balanceRegionScheduler) EncodeConfig() ([]byte, error) {
+	return schedule.EncodeConfig(s.conf)
 }
 
-func (s *balanceRegionScheduler) Schedule(cluster schedule.Cluster, opInfluence schedule.OpInfluence) *schedule.Operator {
+func (s *balanceRegionScheduler) IsScheduleAllowed(cluster opt.Cluster) bool {
+	return s.opController.OperatorCount(operator.OpRegion) < cluster.GetRegionScheduleLimit()
+}
+
+func (s *balanceRegionScheduler) Schedule(cluster opt.Cluster) []*operator.Operator {
 	schedulerCounter.WithLabelValues(s.GetName(), "schedule").Inc()
-	// Select a peer from the store with most regions.
-	region, oldPeer := scheduleRemovePeer(cluster, s.GetName(), s.selector)
-	if region == nil {
-		return nil
-	}
+	stores := cluster.GetStores()
+	stores = filter.SelectSourceStores(stores, s.filters, cluster)
+	opInfluence := s.opController.GetOpInfluence(cluster)
+	kind := core.NewScheduleKind(core.RegionKind, core.BySize)
+	sort.Slice(stores, func(i, j int) bool {
+		iOp := opInfluence.GetStoreInfluence(stores[i].GetID()).ResourceProperty(kind)
+		jOp := opInfluence.GetStoreInfluence(stores[j].GetID()).ResourceProperty(kind)
+		return stores[i].RegionScore(cluster.GetHighSpaceRatio(), cluster.GetLowSpaceRatio(), iOp) >
+			stores[j].RegionScore(cluster.GetHighSpaceRatio(), cluster.GetLowSpaceRatio(), jOp)
+	})
+	for _, source := range stores {
+		sourceID := source.GetID()
 
-	// We don't schedule region with abnormal number of replicas.
-	if len(region.GetPeers()) != cluster.GetMaxReplicas() {
-		schedulerCounter.WithLabelValues(s.GetName(), "abnormal_replica").Inc()
-		return nil
-	}
+		for i := 0; i < balanceRegionRetryLimit; i++ {
+			// Priority pick the region that has a pending peer.
+			// Pending region may means the disk is overload, remove the pending region firstly.
+			region := cluster.RandPendingRegion(sourceID, s.conf.Ranges, opt.HealthAllowPending(cluster), opt.ReplicatedRegion(cluster))
+			if region == nil {
+				// Then pick the region that has a follower in the source store.
+				region = cluster.RandFollowerRegion(sourceID, s.conf.Ranges, opt.HealthRegion(cluster), opt.ReplicatedRegion(cluster))
+			}
+			if region == nil {
+				// Then pick the region has the leader in the source store.
+				region = cluster.RandLeaderRegion(sourceID, s.conf.Ranges, opt.HealthRegion(cluster), opt.ReplicatedRegion(cluster))
+			}
+			if region == nil {
+				// Finally pick learner.
+				region = cluster.RandLearnerRegion(sourceID, s.conf.Ranges, opt.HealthRegion(cluster), opt.ReplicatedRegion(cluster))
+			}
+			if region == nil {
+				schedulerCounter.WithLabelValues(s.GetName(), "no-region").Inc()
+				continue
+			}
+			log.Debug("select region", zap.String("scheduler", s.GetName()), zap.Uint64("region-id", region.GetID()))
 
-	// Skip hot regions.
-	if cluster.IsRegionHot(region.GetId()) {
-		schedulerCounter.WithLabelValues(s.GetName(), "region_hot").Inc()
-		return nil
-	}
+			// Skip hot regions.
+			if cluster.IsRegionHot(region) {
+				log.Debug("region is hot", zap.String("scheduler", s.GetName()), zap.Uint64("region-id", region.GetID()))
+				schedulerCounter.WithLabelValues(s.GetName(), "region-hot").Inc()
+				continue
+			}
 
-	op := s.transferPeer(cluster, region, oldPeer, opInfluence)
-	if op == nil {
-		// We can't transfer peer from this store now, so we add it to the cache
-		// and skip it for a while.
-		s.cache.Put(oldPeer.GetStoreId())
-		return nil
+			oldPeer := region.GetStorePeer(sourceID)
+			if op := s.transferPeer(cluster, region, oldPeer); op != nil {
+				op.Counters = append(op.Counters, schedulerCounter.WithLabelValues(s.GetName(), "new-operator"))
+				return []*operator.Operator{op}
+			}
+		}
 	}
-	schedulerCounter.WithLabelValues(s.GetName(), "new_operator").Inc()
-	return op
+	return nil
 }
 
-func (s *balanceRegionScheduler) transferPeer(cluster schedule.Cluster, region *core.RegionInfo, oldPeer *metapb.Peer, opInfluence schedule.OpInfluence) *schedule.Operator {
+// transferPeer selects the best store to create a new peer to replace the old peer.
+func (s *balanceRegionScheduler) transferPeer(cluster opt.Cluster, region *core.RegionInfo, oldPeer *metapb.Peer) *operator.Operator {
 	// scoreGuard guarantees that the distinct score will not decrease.
 	stores := cluster.GetRegionStores(region)
-	source := cluster.GetStore(oldPeer.GetStoreId())
-	scoreGuard := schedule.NewDistinctScoreFilter(cluster.GetLocationLabels(), stores, source)
-
-	checker := schedule.NewReplicaChecker(cluster, nil)
-	newPeer := checker.SelectBestPeerToAddReplica(region, scoreGuard)
-	if newPeer == nil {
-		schedulerCounter.WithLabelValues(s.GetName(), "no_peer").Inc()
+	sourceStoreID := oldPeer.GetStoreId()
+	source := cluster.GetStore(sourceStoreID)
+	if source == nil {
+		log.Error("failed to get the source store", zap.Uint64("store-id", sourceStoreID))
 		return nil
 	}
+	exclude := make(map[uint64]struct{})
+	excludeFilter := filter.NewExcludedFilter(s.GetName(), nil, exclude)
+	for {
+		var target *core.StoreInfo
+		if cluster.IsPlacementRulesEnabled() {
+			scoreGuard := filter.NewRuleFitFilter(s.GetName(), cluster, region, sourceStoreID)
+			fit := cluster.FitRegion(region)
+			rf := fit.GetRuleFit(oldPeer.GetId())
+			if rf == nil {
+				schedulerCounter.WithLabelValues(s.GetName(), "skip-orphan-peer").Inc()
+				return nil
+			}
+			target = checker.SelectStoreToReplacePeerByRule(s.GetName(), cluster, region, fit, rf, oldPeer, scoreGuard, excludeFilter)
+		} else {
+			scoreGuard := filter.NewDistinctScoreFilter(s.GetName(), cluster.GetLocationLabels(), stores, source)
+			replicaChecker := checker.NewReplicaChecker(cluster, s.GetName())
+			storeID, _ := replicaChecker.SelectBestReplacementStore(region, oldPeer, scoreGuard, excludeFilter)
+			if storeID != 0 {
+				target = cluster.GetStore(storeID)
+			}
+		}
+		if target == nil {
+			schedulerCounter.WithLabelValues(s.GetName(), "no-replacement").Inc()
+			return nil
+		}
+		exclude[target.GetID()] = struct{}{} // exclude next round.
 
-	target := cluster.GetStore(newPeer.GetStoreId())
-	avgScore := cluster.GetStoresAverageScore(core.RegionKind)
-	if !shouldBalance(source, target, avgScore, core.RegionKind, region, opInfluence, cluster.GetTolerantSizeRatio()) {
-		schedulerCounter.WithLabelValues(s.GetName(), "skip").Inc()
-		return nil
+		regionID := region.GetID()
+		sourceID := source.GetID()
+		targetID := target.GetID()
+		log.Debug("", zap.Uint64("region-id", regionID), zap.Uint64("source-store", sourceID), zap.Uint64("target-store", targetID))
+
+		opInfluence := s.opController.GetOpInfluence(cluster)
+		kind := core.NewScheduleKind(core.RegionKind, core.BySize)
+		if !shouldBalance(cluster, source, target, region, kind, opInfluence, s.GetName()) {
+			schedulerCounter.WithLabelValues(s.GetName(), "skip").Inc()
+			continue
+		}
+
+		newPeer := &metapb.Peer{StoreId: target.GetID(), IsLearner: oldPeer.IsLearner}
+		op, err := operator.CreateMovePeerOperator("balance-region", cluster, region, operator.OpBalance, oldPeer.GetStoreId(), newPeer)
+		if err != nil {
+			schedulerCounter.WithLabelValues(s.GetName(), "create-operator-fail").Inc()
+			return nil
+		}
+		sourceLabel := strconv.FormatUint(sourceID, 10)
+		targetLabel := strconv.FormatUint(targetID, 10)
+		op.Counters = append(op.Counters,
+			s.counter.WithLabelValues("move-peer", source.GetAddress()+"-out", sourceLabel),
+			s.counter.WithLabelValues("move-peer", target.GetAddress()+"-in", targetLabel),
+			balanceDirectionCounter.WithLabelValues(s.GetName(), sourceLabel, targetLabel),
+		)
+		return op
 	}
-	s.limit = adjustBalanceLimit(cluster, core.RegionKind)
-
-	return schedule.CreateMovePeerOperator("balance-region", region, schedule.OpBalance, oldPeer.GetStoreId(), newPeer.GetStoreId(), newPeer.GetId())
 }

@@ -15,14 +15,14 @@ package api
 
 import (
 	"fmt"
-	"net/http"
 	"net/url"
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/kvproto/pkg/metapb"
-	"github.com/pingcap/pd/pkg/apiutil"
-	"github.com/pingcap/pd/server"
-	"github.com/pingcap/pd/server/core"
+	"github.com/pingcap/pd/v4/pkg/apiutil"
+	"github.com/pingcap/pd/v4/server"
+	"github.com/pingcap/pd/v4/server/core"
+	"github.com/pingcap/pd/v4/server/statistics"
 )
 
 var _ = Suite(&testStatsSuite{})
@@ -49,24 +49,28 @@ func (s *testStatsSuite) TearDownSuite(c *C) {
 
 func (s *testStatsSuite) TestRegionStats(c *C) {
 	statsURL := s.urlPrefix + "/stats/region"
-
+	epoch := &metapb.RegionEpoch{
+		ConfVer: 1,
+		Version: 1,
+	}
 	regions := []*core.RegionInfo{
-		{
-			Region: &metapb.Region{
-				Id:       1,
-				StartKey: []byte(""),
-				EndKey:   []byte("a"),
-				Peers: []*metapb.Peer{
-					{Id: 101, StoreId: 1},
-					{Id: 102, StoreId: 2},
-					{Id: 103, StoreId: 3},
-				},
+		core.NewRegionInfo(&metapb.Region{
+			Id:       1,
+			StartKey: []byte(""),
+			EndKey:   []byte("a"),
+			Peers: []*metapb.Peer{
+				{Id: 101, StoreId: 1},
+				{Id: 102, StoreId: 2},
+				{Id: 103, StoreId: 3},
 			},
-			Leader:          &metapb.Peer{Id: 101, StoreId: 1},
-			ApproximateSize: 100,
+			RegionEpoch: epoch,
 		},
-		{
-			Region: &metapb.Region{
+			&metapb.Peer{Id: 101, StoreId: 1},
+			core.SetApproximateSize(100),
+			core.SetApproximateKeys(50),
+		),
+		core.NewRegionInfo(
+			&metapb.Region{
 				Id:       2,
 				StartKey: []byte("a"),
 				EndKey:   []byte("t"),
@@ -75,12 +79,14 @@ func (s *testStatsSuite) TestRegionStats(c *C) {
 					{Id: 105, StoreId: 4},
 					{Id: 106, StoreId: 5},
 				},
+				RegionEpoch: epoch,
 			},
-			Leader:          &metapb.Peer{Id: 105, StoreId: 4},
-			ApproximateSize: 200,
-		},
-		{
-			Region: &metapb.Region{
+			&metapb.Peer{Id: 105, StoreId: 4},
+			core.SetApproximateSize(200),
+			core.SetApproximateKeys(150),
+		),
+		core.NewRegionInfo(
+			&metapb.Region{
 				Id:       3,
 				StartKey: []byte("t"),
 				EndKey:   []byte("x"),
@@ -88,22 +94,26 @@ func (s *testStatsSuite) TestRegionStats(c *C) {
 					{Id: 106, StoreId: 1},
 					{Id: 107, StoreId: 5},
 				},
+				RegionEpoch: epoch,
 			},
-			Leader:          &metapb.Peer{Id: 107, StoreId: 5},
-			ApproximateSize: 1,
-		},
-		{
-			Region: &metapb.Region{
+			&metapb.Peer{Id: 107, StoreId: 5},
+			core.SetApproximateSize(1),
+			core.SetApproximateKeys(1),
+		),
+		core.NewRegionInfo(
+			&metapb.Region{
 				Id:       4,
 				StartKey: []byte("x"),
 				EndKey:   []byte(""),
 				Peers: []*metapb.Peer{
 					{Id: 108, StoreId: 4},
 				},
+				RegionEpoch: epoch,
 			},
-			Leader:          &metapb.Peer{Id: 108, StoreId: 4},
-			ApproximateSize: 50,
-		},
+			&metapb.Peer{Id: 108, StoreId: 4},
+			core.SetApproximateSize(50),
+			core.SetApproximateKeys(20),
+		),
 	}
 
 	for _, r := range regions {
@@ -111,41 +121,56 @@ func (s *testStatsSuite) TestRegionStats(c *C) {
 	}
 
 	// Distribution (L for leader, F for follower):
-	// region range       size  store1 store2 store3 store4 store5
-	// 1      ["", "a")   100   L      F      F
-	// 2      ["a", "t")  200   F                    L      F
-	// 3      ["t", "x")  1     F                           L
-	// 4      ["x", "")   50                         L
+	// region range       size  rows store1 store2 store3 store4 store5
+	// 1      ["", "a")   100   50 	  L      F      F
+	// 2      ["a", "t")  200   150	  F                    L      F
+	// 3      ["t", "x")  1     1	  F                           L
+	// 4      ["x", "")   50    20                   	   L
 
-	statsAll := &core.RegionStats{
+	statsAll := &statistics.RegionStats{
 		Count:            4,
 		EmptyCount:       1,
 		StorageSize:      351,
+		StorageKeys:      221,
 		StoreLeaderCount: map[uint64]int{1: 1, 4: 2, 5: 1},
 		StorePeerCount:   map[uint64]int{1: 3, 2: 1, 3: 1, 4: 2, 5: 2},
 		StoreLeaderSize:  map[uint64]int64{1: 100, 4: 250, 5: 1},
+		StoreLeaderKeys:  map[uint64]int64{1: 50, 4: 170, 5: 1},
 		StorePeerSize:    map[uint64]int64{1: 301, 2: 100, 3: 100, 4: 250, 5: 201},
+		StorePeerKeys:    map[uint64]int64{1: 201, 2: 50, 3: 50, 4: 170, 5: 151},
 	}
-	res, err := http.Get(statsURL)
+	res, err := testDialClient.Get(statsURL)
 	c.Assert(err, IsNil)
-	stats := &core.RegionStats{}
+	stats := &statistics.RegionStats{}
 	err = apiutil.ReadJSON(res.Body, stats)
 	c.Assert(err, IsNil)
 	c.Assert(stats, DeepEquals, statsAll)
 
-	stats23 := &core.RegionStats{
+	args := fmt.Sprintf("?start_key=%s&end_key=%s", url.QueryEscape("\x01\x02"), url.QueryEscape("xyz\x00\x00"))
+	res, err = testDialClient.Get(statsURL + args)
+	c.Assert(err, IsNil)
+	stats = &statistics.RegionStats{}
+	err = apiutil.ReadJSON(res.Body, stats)
+	c.Assert(err, IsNil)
+	c.Assert(stats, DeepEquals, statsAll)
+
+	stats23 := &statistics.RegionStats{
 		Count:            2,
 		EmptyCount:       1,
 		StorageSize:      201,
+		StorageKeys:      151,
 		StoreLeaderCount: map[uint64]int{4: 1, 5: 1},
 		StorePeerCount:   map[uint64]int{1: 2, 4: 1, 5: 2},
 		StoreLeaderSize:  map[uint64]int64{4: 200, 5: 1},
+		StoreLeaderKeys:  map[uint64]int64{4: 150, 5: 1},
 		StorePeerSize:    map[uint64]int64{1: 201, 4: 200, 5: 201},
+		StorePeerKeys:    map[uint64]int64{1: 151, 4: 150, 5: 151},
 	}
-	args := fmt.Sprintf("?start_key=%s&end_key=%s", url.QueryEscape("\x01\x02"), url.QueryEscape("xyz\x00\x00"))
-	res, err = http.Get(statsURL + args)
+
+	args = fmt.Sprintf("?start_key=%s&end_key=%s", url.QueryEscape("a"), url.QueryEscape("x"))
+	res, err = testDialClient.Get(statsURL + args)
 	c.Assert(err, IsNil)
-	stats = &core.RegionStats{}
+	stats = &statistics.RegionStats{}
 	err = apiutil.ReadJSON(res.Body, stats)
 	c.Assert(err, IsNil)
 	c.Assert(stats, DeepEquals, stats23)

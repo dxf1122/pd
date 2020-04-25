@@ -15,19 +15,22 @@ package api
 
 import (
 	"fmt"
+	"time"
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/kvproto/pkg/metapb"
-	"github.com/pingcap/pd/server"
-	"github.com/pingcap/pd/server/core"
+	"github.com/pingcap/pd/v4/server"
+	"github.com/pingcap/pd/v4/server/config"
+	"github.com/pingcap/pd/v4/server/core"
+	"github.com/pingcap/pd/v4/server/schedule/operator"
 )
 
 var _ = Suite(&testTrendSuite{})
 
 type testTrendSuite struct{}
 
-func (s *testTrendSuite) TestTend(c *C) {
-	svr, cleanup := mustNewServer(c)
+func (s *testTrendSuite) TestTrend(c *C) {
+	svr, cleanup := mustNewServer(c, func(cfg *config.Config) { cfg.Schedule.StoreBalanceRate = 60 })
 	defer cleanup()
 	mustWaitLeader(c, []*server.Server{svr})
 
@@ -37,22 +40,42 @@ func (s *testTrendSuite) TestTend(c *C) {
 	}
 
 	// Create 3 regions, all peers on store1 and store2, and the leaders are all on store1.
-	mustRegionHeartbeat(c, svr, s.newRegionInfo(4, "", "a", 2, 2, []uint64{1, 2}, 1))
-	mustRegionHeartbeat(c, svr, s.newRegionInfo(5, "a", "b", 2, 2, []uint64{1, 2}, 1))
-	mustRegionHeartbeat(c, svr, s.newRegionInfo(6, "b", "", 2, 2, []uint64{1, 2}, 1))
+	region4 := s.newRegionInfo(4, "", "a", 2, 2, []uint64{1, 2}, nil, 1)
+	region5 := s.newRegionInfo(5, "a", "b", 2, 2, []uint64{1, 2}, nil, 1)
+	region6 := s.newRegionInfo(6, "b", "", 2, 2, []uint64{1, 2}, nil, 1)
+	mustRegionHeartbeat(c, svr, region4)
+	mustRegionHeartbeat(c, svr, region5)
+	mustRegionHeartbeat(c, svr, region6)
 
 	// Create 3 operators that transfers leader, moves follower, moves leader.
-	svr.GetHandler().AddTransferLeaderOperator(4, 2)
-	svr.GetHandler().AddTransferPeerOperator(5, 2, 3)
-	svr.GetHandler().AddTransferPeerOperator(6, 1, 3)
+	c.Assert(svr.GetHandler().AddTransferLeaderOperator(4, 2), IsNil)
+	c.Assert(svr.GetHandler().AddTransferPeerOperator(5, 2, 3), IsNil)
+	time.Sleep(1 * time.Second)
+	c.Assert(svr.GetHandler().AddTransferPeerOperator(6, 1, 3), IsNil)
 
 	// Complete the operators.
-	mustRegionHeartbeat(c, svr, s.newRegionInfo(4, "", "a", 2, 2, []uint64{1, 2}, 2))
-	mustRegionHeartbeat(c, svr, s.newRegionInfo(5, "a", "b", 3, 2, []uint64{1, 3}, 1))
-	mustRegionHeartbeat(c, svr, s.newRegionInfo(6, "b", "", 3, 2, []uint64{2, 3}, 2))
+	mustRegionHeartbeat(c, svr, region4.Clone(core.WithLeader(region4.GetStorePeer(2))))
+
+	op, err := svr.GetHandler().GetOperator(5)
+	c.Assert(err, IsNil)
+	c.Assert(op, NotNil)
+	newPeerID := op.Step(0).(operator.AddLearner).PeerID
+	region5 = region5.Clone(core.WithAddPeer(&metapb.Peer{Id: newPeerID, StoreId: 3, IsLearner: true}), core.WithIncConfVer())
+	mustRegionHeartbeat(c, svr, region5)
+	region5 = region5.Clone(core.WithPromoteLearner(newPeerID), core.WithRemoveStorePeer(2), core.WithIncConfVer())
+	mustRegionHeartbeat(c, svr, region5)
+
+	op, err = svr.GetHandler().GetOperator(6)
+	c.Assert(err, IsNil)
+	c.Assert(op, NotNil)
+	newPeerID = op.Step(0).(operator.AddLearner).PeerID
+	region6 = region6.Clone(core.WithAddPeer(&metapb.Peer{Id: newPeerID, StoreId: 3, IsLearner: true}), core.WithIncConfVer())
+	mustRegionHeartbeat(c, svr, region6)
+	region6 = region6.Clone(core.WithPromoteLearner(newPeerID), core.WithLeader(region6.GetStorePeer(2)), core.WithRemoveStorePeer(1), core.WithIncConfVer())
+	mustRegionHeartbeat(c, svr, region6)
 
 	var trend Trend
-	err := readJSONWithURL(fmt.Sprintf("%s%s/api/v1/trend", svr.GetAddr(), apiPrefix), &trend)
+	err = readJSON(testDialClient, fmt.Sprintf("%s%s/api/v1/trend", svr.GetAddr(), apiPrefix), &trend)
 	c.Assert(err, IsNil)
 
 	// Check store states.
@@ -76,26 +99,30 @@ func (s *testTrendSuite) TestTend(c *C) {
 	}
 }
 
-func (s *testTrendSuite) newRegionInfo(id uint64, startKey, endKey string, confVer, ver uint64, stores []uint64, leaderStore uint64) *core.RegionInfo {
+func (s *testTrendSuite) newRegionInfo(id uint64, startKey, endKey string, confVer, ver uint64, voters []uint64, learners []uint64, leaderStore uint64) *core.RegionInfo {
 	var (
 		peers  []*metapb.Peer
 		leader *metapb.Peer
 	)
-	for _, id := range stores {
-		p := &metapb.Peer{Id: id, StoreId: id}
+	for _, id := range voters {
+		p := &metapb.Peer{Id: 10 + id, StoreId: id}
 		if id == leaderStore {
 			leader = p
 		}
 		peers = append(peers, p)
 	}
-	return &core.RegionInfo{
-		Region: &metapb.Region{
+	for _, id := range learners {
+		p := &metapb.Peer{Id: 10 + id, StoreId: id, IsLearner: true}
+		peers = append(peers, p)
+	}
+	return core.NewRegionInfo(
+		&metapb.Region{
 			Id:          id,
 			StartKey:    []byte(startKey),
 			EndKey:      []byte(endKey),
 			RegionEpoch: &metapb.RegionEpoch{ConfVer: confVer, Version: ver},
 			Peers:       peers,
 		},
-		Leader: leader,
-	}
+		leader,
+	)
 }

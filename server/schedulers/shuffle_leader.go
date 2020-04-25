@@ -14,83 +14,114 @@
 package schedulers
 
 import (
-	"github.com/pingcap/kvproto/pkg/metapb"
-	"github.com/pingcap/pd/server/core"
-	"github.com/pingcap/pd/server/schedule"
+	"github.com/pingcap/log"
+	"github.com/pingcap/pd/v4/server/core"
+	"github.com/pingcap/pd/v4/server/schedule"
+	"github.com/pingcap/pd/v4/server/schedule/filter"
+	"github.com/pingcap/pd/v4/server/schedule/operator"
+	"github.com/pingcap/pd/v4/server/schedule/opt"
+	"github.com/pingcap/pd/v4/server/schedule/selector"
+	"github.com/pkg/errors"
+	"go.uber.org/zap"
+)
+
+const (
+	// ShuffleLeaderName is shuffle leader scheduler name.
+	ShuffleLeaderName = "shuffle-leader-scheduler"
+	// ShuffleLeaderType is shuffle leader scheduler type.
+	ShuffleLeaderType = "shuffle-leader"
 )
 
 func init() {
-	schedule.RegisterScheduler("shuffle-leader", func(limiter *schedule.Limiter, args []string) (schedule.Scheduler, error) {
-		return newShuffleLeaderScheduler(limiter), nil
+	schedule.RegisterSliceDecoderBuilder(ShuffleLeaderType, func(args []string) schedule.ConfigDecoder {
+		return func(v interface{}) error {
+			conf, ok := v.(*shuffleLeaderSchedulerConfig)
+			if !ok {
+				return ErrScheduleConfigNotExist
+			}
+			ranges, err := getKeyRanges(args)
+			if err != nil {
+				return errors.WithStack(err)
+			}
+			conf.Ranges = ranges
+			conf.Name = ShuffleLeaderName
+			return nil
+		}
+	})
+
+	schedule.RegisterScheduler(ShuffleLeaderType, func(opController *schedule.OperatorController, storage *core.Storage, decoder schedule.ConfigDecoder) (schedule.Scheduler, error) {
+		conf := &shuffleLeaderSchedulerConfig{}
+		if err := decoder(conf); err != nil {
+			return nil, err
+		}
+		return newShuffleLeaderScheduler(opController, conf), nil
 	})
 }
 
+type shuffleLeaderSchedulerConfig struct {
+	Name   string          `json:"name"`
+	Ranges []core.KeyRange `json:"ranges"`
+}
+
 type shuffleLeaderScheduler struct {
-	*baseScheduler
-	selector schedule.Selector
-	selected *metapb.Peer
+	*BaseScheduler
+	conf     *shuffleLeaderSchedulerConfig
+	selector *selector.RandomSelector
 }
 
 // newShuffleLeaderScheduler creates an admin scheduler that shuffles leaders
 // between stores.
-func newShuffleLeaderScheduler(limiter *schedule.Limiter) schedule.Scheduler {
-	filters := []schedule.Filter{
-		schedule.NewStateFilter(),
-		schedule.NewHealthFilter(),
+func newShuffleLeaderScheduler(opController *schedule.OperatorController, conf *shuffleLeaderSchedulerConfig) schedule.Scheduler {
+	filters := []filter.Filter{
+		filter.StoreStateFilter{ActionScope: conf.Name, TransferLeader: true},
+		filter.NewSpecialUseFilter(conf.Name),
 	}
-	base := newBaseScheduler(limiter)
+	base := NewBaseScheduler(opController)
 	return &shuffleLeaderScheduler{
-		baseScheduler: base,
-		selector:      schedule.NewRandomSelector(filters),
+		BaseScheduler: base,
+		conf:          conf,
+		selector:      selector.NewRandomSelector(filters),
 	}
 }
 
 func (s *shuffleLeaderScheduler) GetName() string {
-	return "shuffle-leader-scheduler"
+	return s.conf.Name
 }
 
 func (s *shuffleLeaderScheduler) GetType() string {
-	return "shuffle-leader"
+	return ShuffleLeaderType
 }
 
-func (s *shuffleLeaderScheduler) IsScheduleAllowed(cluster schedule.Cluster) bool {
-	return s.limiter.OperatorCount(schedule.OpLeader) < cluster.GetLeaderScheduleLimit()
+func (s *shuffleLeaderScheduler) EncodeConfig() ([]byte, error) {
+	return schedule.EncodeConfig(s.conf)
 }
 
-func (s *shuffleLeaderScheduler) Schedule(cluster schedule.Cluster, opInfluence schedule.OpInfluence) *schedule.Operator {
-	// We shuffle leaders between stores:
-	// 1. select a store randomly.
-	// 2. transfer a leader from the store to another store.
-	// 3. transfer a leader to the store from another store.
-	// These will not change store's leader count, but swap leaders between stores.
+func (s *shuffleLeaderScheduler) IsScheduleAllowed(cluster opt.Cluster) bool {
+	return s.OpController.OperatorCount(operator.OpLeader) < cluster.GetLeaderScheduleLimit()
+}
 
+func (s *shuffleLeaderScheduler) Schedule(cluster opt.Cluster) []*operator.Operator {
+	// We shuffle leaders between stores by:
+	// 1. random select a valid store.
+	// 2. transfer a leader to the store.
 	schedulerCounter.WithLabelValues(s.GetName(), "schedule").Inc()
-	// Select a store and transfer a leader from it.
-	if s.selected == nil {
-		region, newLeader := scheduleTransferLeader(cluster, s.GetName(), s.selector)
-		if region == nil {
-			return nil
-		}
-		// Mark the selected store.
-		s.selected = region.Leader
-		schedulerCounter.WithLabelValues(s.GetName(), "new_operator").Inc()
-		step := schedule.TransferLeader{FromStore: region.Leader.GetStoreId(), ToStore: newLeader.GetStoreId()}
-		return schedule.NewOperator("shuffle-leader", region.GetId(), schedule.OpAdmin|schedule.OpLeader, step)
-	}
-
-	// Reset the selected store.
-	storeID := s.selected.GetStoreId()
-	s.selected = nil
-
-	// Transfer a leader to the selected store.
-	region := cluster.RandFollowerRegion(storeID)
-	if region == nil {
-		schedulerCounter.WithLabelValues(s.GetName(), "no_follower").Inc()
+	stores := cluster.GetStores()
+	targetStore := s.selector.SelectTarget(cluster, stores)
+	if targetStore == nil {
+		schedulerCounter.WithLabelValues(s.GetName(), "no-target-store").Inc()
 		return nil
 	}
-	schedulerCounter.WithLabelValues(s.GetName(), "new_operator").Inc()
-	step := schedule.TransferLeader{FromStore: region.Leader.GetStoreId(), ToStore: storeID}
-	op := schedule.NewOperator("shuffleSelectedLeader", region.GetId(), schedule.OpAdmin|schedule.OpLeader, step)
+	region := cluster.RandFollowerRegion(targetStore.GetID(), s.conf.Ranges, opt.HealthRegion(cluster))
+	if region == nil {
+		schedulerCounter.WithLabelValues(s.GetName(), "no-follower").Inc()
+		return nil
+	}
+	op, err := operator.CreateTransferLeaderOperator(ShuffleLeaderType, cluster, region, region.GetLeader().GetId(), targetStore.GetID(), operator.OpAdmin)
+	if err != nil {
+		log.Debug("fail to create shuffle leader operator", zap.Error(err))
+		return nil
+	}
 	op.SetPriorityLevel(core.HighPriority)
-	return op
+	op.Counters = append(op.Counters, schedulerCounter.WithLabelValues(s.GetName(), "new-operator"))
+	return []*operator.Operator{op}
 }

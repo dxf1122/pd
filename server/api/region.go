@@ -14,20 +14,22 @@
 package api
 
 import (
-	"fmt"
+	"container/heap"
 	"net/http"
+	"sort"
 	"strconv"
-	"strings"
 
 	"github.com/gorilla/mux"
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/kvproto/pkg/pdpb"
-	"github.com/pingcap/pd/server"
-	"github.com/pingcap/pd/server/core"
+	"github.com/pingcap/kvproto/pkg/replication_modepb"
+	"github.com/pingcap/pd/v4/server"
+	"github.com/pingcap/pd/v4/server/core"
 	"github.com/unrolled/render"
 )
 
-type regionInfo struct {
+// RegionInfo records detail region info for api usage.
+type RegionInfo struct {
 	ID          uint64              `json:"id"`
 	StartKey    string              `json:"start_key"`
 	EndKey      string              `json:"end_key"`
@@ -37,34 +39,66 @@ type regionInfo struct {
 	Leader          *metapb.Peer      `json:"leader,omitempty"`
 	DownPeers       []*pdpb.PeerStats `json:"down_peers,omitempty"`
 	PendingPeers    []*metapb.Peer    `json:"pending_peers,omitempty"`
-	WrittenBytes    uint64            `json:"written_bytes,omitempty"`
-	ReadBytes       uint64            `json:"read_bytes,omitempty"`
-	ApproximateSize int64             `json:"approximate_size,omitempty"`
+	WrittenBytes    uint64            `json:"written_bytes"`
+	ReadBytes       uint64            `json:"read_bytes"`
+	WrittenKeys     uint64            `json:"written_keys"`
+	ReadKeys        uint64            `json:"read_keys"`
+	ApproximateSize int64             `json:"approximate_size"`
+	ApproximateKeys int64             `json:"approximate_keys"`
+
+	ReplicationStatus *ReplicationStatus `json:"replication_status,omitempty"`
 }
 
-func newRegionInfo(r *core.RegionInfo) *regionInfo {
+// ReplicationStatus represents the replication mode status of the region.
+type ReplicationStatus struct {
+	State   string `json:"state"`
+	StateID uint64 `json:"state_id"`
+}
+
+func fromPBReplicationStatus(s *replication_modepb.RegionReplicationStatus) *ReplicationStatus {
+	if s == nil {
+		return nil
+	}
+	return &ReplicationStatus{
+		State:   replication_modepb.RegionReplicationState_name[int32(s.GetState())],
+		StateID: s.GetStateId(),
+	}
+}
+
+// NewRegionInfo create a new api RegionInfo.
+func NewRegionInfo(r *core.RegionInfo) *RegionInfo {
+	return InitRegion(r, &RegionInfo{})
+}
+
+// InitRegion init a new api RegionInfo from the core.RegionInfo.
+func InitRegion(r *core.RegionInfo, s *RegionInfo) *RegionInfo {
 	if r == nil {
 		return nil
 	}
-	return &regionInfo{
-		ID:          r.Id,
-		StartKey:    strings.Trim(fmt.Sprintf("%q", r.StartKey), "\""),
-		EndKey:      strings.Trim(fmt.Sprintf("%q", r.EndKey), "\""),
-		RegionEpoch: r.RegionEpoch,
-		Peers:       r.Peers,
 
-		Leader:          r.Leader,
-		DownPeers:       r.DownPeers,
-		PendingPeers:    r.PendingPeers,
-		WrittenBytes:    r.WrittenBytes,
-		ReadBytes:       r.ReadBytes,
-		ApproximateSize: r.ApproximateSize,
-	}
+	s.ID = r.GetID()
+	s.StartKey = core.HexRegionKeyStr(r.GetStartKey())
+	s.EndKey = core.HexRegionKeyStr(r.GetEndKey())
+	s.RegionEpoch = r.GetRegionEpoch()
+	s.Peers = r.GetPeers()
+	s.Leader = r.GetLeader()
+	s.DownPeers = r.GetDownPeers()
+	s.PendingPeers = r.GetPendingPeers()
+	s.WrittenBytes = r.GetBytesWritten()
+	s.WrittenKeys = r.GetKeysWritten()
+	s.ReadBytes = r.GetBytesRead()
+	s.ReadKeys = r.GetKeysRead()
+	s.ApproximateSize = r.GetApproximateSize()
+	s.ApproximateKeys = r.GetApproximateKeys()
+	s.ReplicationStatus = fromPBReplicationStatus(r.GetReplicationStatus())
+
+	return s
 }
 
-type regionsInfo struct {
+// RegionsInfo contains some regions with the detailed region info.
+type RegionsInfo struct {
 	Count   int           `json:"count"`
-	Regions []*regionInfo `json:"regions"`
+	Regions []*RegionInfo `json:"regions"`
 }
 
 type regionHandler struct {
@@ -79,35 +113,40 @@ func newRegionHandler(svr *server.Server, rd *render.Render) *regionHandler {
 	}
 }
 
+// @Tags region
+// @Summary Search for a region by region ID.
+// @Param id path integer true "Region Id"
+// @Produce json
+// @Success 200 {object} RegionInfo
+// @Failure 400 {string} string "The input is invalid."
+// @Router /region/id/{id} [get]
 func (h *regionHandler) GetRegionByID(w http.ResponseWriter, r *http.Request) {
-	cluster := h.svr.GetRaftCluster()
-	if cluster == nil {
-		h.rd.JSON(w, http.StatusInternalServerError, server.ErrNotBootstrapped.Error())
-		return
-	}
+	rc := getCluster(r.Context())
 
 	vars := mux.Vars(r)
 	regionIDStr := vars["id"]
 	regionID, err := strconv.ParseUint(regionIDStr, 10, 64)
 	if err != nil {
-		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+		h.rd.JSON(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	regionInfo := cluster.GetRegionInfoByID(regionID)
-	h.rd.JSON(w, http.StatusOK, newRegionInfo(regionInfo))
+	regionInfo := rc.GetRegion(regionID)
+	h.rd.JSON(w, http.StatusOK, NewRegionInfo(regionInfo))
 }
 
+// @Tags region
+// @Summary Search for a region by a key.
+// @Param key path string true "Region key"
+// @Produce json
+// @Success 200 {object} RegionInfo
+// @Router /region/key/{key} [get]
 func (h *regionHandler) GetRegionByKey(w http.ResponseWriter, r *http.Request) {
-	cluster := h.svr.GetRaftCluster()
-	if cluster == nil {
-		h.rd.JSON(w, http.StatusInternalServerError, server.ErrNotBootstrapped.Error())
-		return
-	}
+	rc := getCluster(r.Context())
 	vars := mux.Vars(r)
 	key := vars["key"]
-	regionInfo := cluster.GetRegionInfoByKey([]byte(key))
-	h.rd.JSON(w, http.StatusOK, newRegionInfo(regionInfo))
+	regionInfo := rc.GetRegionInfoByKey([]byte(key))
+	h.rd.JSON(w, http.StatusOK, NewRegionInfo(regionInfo))
 }
 
 type regionsHandler struct {
@@ -122,21 +161,471 @@ func newRegionsHandler(svr *server.Server, rd *render.Render) *regionsHandler {
 	}
 }
 
-func (h *regionsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	cluster := h.svr.GetRaftCluster()
-	if cluster == nil {
-		h.rd.JSON(w, http.StatusInternalServerError, server.ErrNotBootstrapped.Error())
+func convertToAPIRegions(regions []*core.RegionInfo) *RegionsInfo {
+	regionInfos := make([]RegionInfo, len(regions))
+	regionInfosRefs := make([]*RegionInfo, len(regions))
+
+	for i := 0; i < len(regions); i++ {
+		regionInfosRefs[i] = &regionInfos[i]
+	}
+	for i, r := range regions {
+		regionInfosRefs[i] = InitRegion(r, regionInfosRefs[i])
+	}
+	return &RegionsInfo{
+		Count:   len(regions),
+		Regions: regionInfosRefs,
+	}
+}
+
+// @Tags region
+// @Summary List all regions in the cluster.
+// @Produce json
+// @Success 200 {object} RegionsInfo
+// @Router /regions [get]
+func (h *regionsHandler) GetAll(w http.ResponseWriter, r *http.Request) {
+	rc := getCluster(r.Context())
+	regions := rc.GetRegions()
+	regionsInfo := convertToAPIRegions(regions)
+	h.rd.JSON(w, http.StatusOK, regionsInfo)
+}
+
+// @Tags region
+// @Summary List regions start from a key.
+// @Param key query string true "Region key"
+// @Param limit query integer false "Limit count" default(16)
+// @Produce json
+// @Success 200 {object} RegionsInfo
+// @Failure 400 {string} string "The input is invalid."
+// @Router /regions/key [get]
+func (h *regionsHandler) ScanRegions(w http.ResponseWriter, r *http.Request) {
+	rc := getCluster(r.Context())
+	startKey := r.URL.Query().Get("key")
+
+	limit := defaultRegionLimit
+	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+		var err error
+		limit, err = strconv.Atoi(limitStr)
+		if err != nil {
+			h.rd.JSON(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if limit > maxRegionLimit {
+		limit = maxRegionLimit
+	}
+	regions := rc.ScanRegions([]byte(startKey), nil, limit)
+	regionsInfo := convertToAPIRegions(regions)
+	h.rd.JSON(w, http.StatusOK, regionsInfo)
+}
+
+// @Tags region
+// @Summary Get count of regions.
+// @Produce json
+// @Success 200 {object} RegionsInfo
+// @Router /regions/count [get]
+func (h *regionsHandler) GetRegionCount(w http.ResponseWriter, r *http.Request) {
+	rc := getCluster(r.Context())
+	count := rc.GetRegionCount()
+	h.rd.JSON(w, http.StatusOK, &RegionsInfo{Count: count})
+}
+
+// @Tags region
+// @Summary List all regions of a specific store.
+// @Param id path integer true "Store Id"
+// @Produce json
+// @Success 200 {object} RegionsInfo
+// @Failure 400 {string} string "The input is invalid."
+// @Router /regions/store/{id} [get]
+func (h *regionsHandler) GetStoreRegions(w http.ResponseWriter, r *http.Request) {
+	rc := getCluster(r.Context())
+
+	vars := mux.Vars(r)
+	id, err := strconv.Atoi(vars["id"])
+	if err != nil {
+		h.rd.JSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	regions := rc.GetStoreRegions(uint64(id))
+	regionsInfo := convertToAPIRegions(regions)
+	h.rd.JSON(w, http.StatusOK, regionsInfo)
+}
+
+// @Tags region
+// @Summary List all regions that miss peer.
+// @Produce json
+// @Success 200 {object} RegionsInfo
+// @Failure 500 {string} string "PD server failed to proceed the request."
+// @Router /regions/check/miss-peer [get]
+func (h *regionsHandler) GetMissPeerRegions(w http.ResponseWriter, r *http.Request) {
+	handler := h.svr.GetHandler()
+	regions, err := handler.GetMissPeerRegions()
+	if err != nil {
+		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	regionsInfo := convertToAPIRegions(regions)
+	h.rd.JSON(w, http.StatusOK, regionsInfo)
+}
+
+// @Tags region
+// @Summary List all regions that has extra peer.
+// @Produce json
+// @Success 200 {object} RegionsInfo
+// @Failure 500 {string} string "PD server failed to proceed the request."
+// @Router /regions/check/extra-peer [get]
+func (h *regionsHandler) GetExtraPeerRegions(w http.ResponseWriter, r *http.Request) {
+	handler := h.svr.GetHandler()
+	regions, err := handler.GetExtraPeerRegions()
+	if err != nil {
+		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	regionsInfo := convertToAPIRegions(regions)
+	h.rd.JSON(w, http.StatusOK, regionsInfo)
+}
+
+// @Tags region
+// @Summary List all regions that has pending peer.
+// @Produce json
+// @Success 200 {object} RegionsInfo
+// @Failure 500 {string} string "PD server failed to proceed the request."
+// @Router /regions/check/pending-peer [get]
+func (h *regionsHandler) GetPendingPeerRegions(w http.ResponseWriter, r *http.Request) {
+	handler := h.svr.GetHandler()
+	regions, err := handler.GetPendingPeerRegions()
+	if err != nil {
+		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	regionsInfo := convertToAPIRegions(regions)
+	h.rd.JSON(w, http.StatusOK, regionsInfo)
+}
+
+// @Tags region
+// @Summary List all regions that has down peer.
+// @Produce json
+// @Success 200 {object} RegionsInfo
+// @Failure 500 {string} string "PD server failed to proceed the request."
+// @Router /regions/check/down-peer [get]
+func (h *regionsHandler) GetDownPeerRegions(w http.ResponseWriter, r *http.Request) {
+	handler := h.svr.GetHandler()
+	regions, err := handler.GetDownPeerRegions()
+	if err != nil {
+		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	regionsInfo := convertToAPIRegions(regions)
+	h.rd.JSON(w, http.StatusOK, regionsInfo)
+}
+
+// @Tags region
+// @Summary List all regions that has offline peer.
+// @Produce json
+// @Success 200 {object} RegionsInfo
+// @Failure 500 {string} string "PD server failed to proceed the request."
+// @Router /regions/check/offline-peer [get]
+func (h *regionsHandler) GetOfflinePeer(w http.ResponseWriter, r *http.Request) {
+	handler := h.svr.GetHandler()
+	regions, err := handler.GetOfflinePeer()
+	if err != nil {
+		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	regionsInfo := convertToAPIRegions(regions)
+	h.rd.JSON(w, http.StatusOK, regionsInfo)
+}
+
+// @Tags region
+// @Summary List all empty regions.
+// @Produce json
+// @Success 200 {object} RegionsInfo
+// @Failure 500 {string} string "PD server failed to proceed the request."
+// @Router /regions/check/empty-region [get]
+func (h *regionsHandler) GetEmptyRegion(w http.ResponseWriter, r *http.Request) {
+	handler := h.svr.GetHandler()
+	regions, err := handler.GetEmptyRegion()
+	if err != nil {
+		h.rd.JSON(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	regionsInfo := convertToAPIRegions(regions)
+	h.rd.JSON(w, http.StatusOK, regionsInfo)
+}
+
+type histItem struct {
+	Start int64 `json:"start"`
+	End   int64 `json:"end"`
+	Count int64 `json:"count"`
+}
+
+type histSlice []*histItem
+
+func (hist histSlice) Len() int {
+	return len(hist)
+}
+
+func (hist histSlice) Swap(i, j int) {
+	hist[i], hist[j] = hist[j], hist[i]
+}
+
+func (hist histSlice) Less(i, j int) bool {
+	return hist[i].Start < hist[j].Start
+}
+
+// @Tags region
+// @Summary Get size of histogram.
+// @Param bound query integer false "Size bound of region histogram" minimum(1)
+// @Produce json
+// @Success 200 {array} histItem
+// @Failure 400 {string} string "The input is invalid."
+// @Router /regions/check/hist-size [get]
+func (h *regionsHandler) GetSizeHistogram(w http.ResponseWriter, r *http.Request) {
+	bound := minRegionHistogramSize
+	bound, err := calBound(bound, r)
+	if err != nil {
+		h.rd.JSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	rc := getCluster(r.Context())
+	regions := rc.GetRegions()
+	histSizes := make([]int64, 0, len(regions))
+	for _, region := range regions {
+		histSizes = append(histSizes, region.GetApproximateSize())
+	}
+	histItems := calHist(bound, &histSizes)
+	h.rd.JSON(w, http.StatusOK, histItems)
+}
+
+// @Tags region
+// @Summary Get keys of histogram.
+// @Param bound query integer false "Key bound of region histogram" minimum(1000)
+// @Produce json
+// @Success 200 {array} histItem
+// @Failure 400 {string} string "The input is invalid."
+// @Router /regions/check/hist-keys [get]
+func (h *regionsHandler) GetKeysHistogram(w http.ResponseWriter, r *http.Request) {
+	bound := minRegionHistogramKeys
+	bound, err := calBound(bound, r)
+	if err != nil {
+		h.rd.JSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	rc := getCluster(r.Context())
+	regions := rc.GetRegions()
+	histKeys := make([]int64, 0, len(regions))
+	for _, region := range regions {
+		histKeys = append(histKeys, region.GetApproximateKeys())
+	}
+	histItems := calHist(bound, &histKeys)
+	h.rd.JSON(w, http.StatusOK, histItems)
+}
+
+func calBound(bound int, r *http.Request) (int, error) {
+	if boundStr := r.URL.Query().Get("bound"); boundStr != "" {
+		boundInput, err := strconv.Atoi(boundStr)
+		if err != nil {
+			return -1, err
+		}
+		if bound < boundInput {
+			bound = boundInput
+		}
+	}
+	return bound, nil
+}
+
+func calHist(bound int, list *[]int64) *[]*histItem {
+	var histMap = make(map[int64]int)
+	for _, item := range *list {
+		multiple := item / int64(bound)
+		if oldCount, ok := histMap[multiple]; ok {
+			histMap[multiple] = oldCount + 1
+		} else {
+			histMap[multiple] = 1
+		}
+	}
+	histItems := make([]*histItem, 0, len(histMap))
+	for multiple, count := range histMap {
+		histInfo := &histItem{}
+		histInfo.Start = multiple * int64(bound)
+		histInfo.End = (multiple+1)*int64(bound) - 1
+		histInfo.Count = int64(count)
+		histItems = append(histItems, histInfo)
+	}
+	sort.Sort(histSlice(histItems))
+	return &histItems
+}
+
+// @Tags region
+// @Summary List sibling regions of a specific region.
+// @Param id path integer true "Region Id"
+// @Produce json
+// @Success 200 {object} RegionsInfo
+// @Failure 400 {string} string "The input is invalid."
+// @Failure 404 {string} string "The region does not exist."
+// @Router /regions/sibling/{id} [get]
+func (h *regionsHandler) GetRegionSiblings(w http.ResponseWriter, r *http.Request) {
+	rc := getCluster(r.Context())
+
+	vars := mux.Vars(r)
+	id, err := strconv.Atoi(vars["id"])
+	if err != nil {
+		h.rd.JSON(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	region := rc.GetRegion(uint64(id))
+	if region == nil {
+		h.rd.JSON(w, http.StatusNotFound, server.ErrRegionNotFound(uint64(id)).Error())
 		return
 	}
 
-	regions := cluster.GetRegions()
-	regionInfos := make([]*regionInfo, len(regions))
-	for i, r := range regions {
-		regionInfos[i] = newRegionInfo(&core.RegionInfo{Region: r})
-	}
-	regionsInfo := &regionsInfo{
-		Count:   len(regions),
-		Regions: regionInfos,
-	}
+	left, right := rc.GetAdjacentRegions(region)
+	regionsInfo := convertToAPIRegions([]*core.RegionInfo{left, right})
 	h.rd.JSON(w, http.StatusOK, regionsInfo)
+}
+
+const (
+	defaultRegionLimit     = 16
+	maxRegionLimit         = 10240
+	minRegionHistogramSize = 1
+	minRegionHistogramKeys = 1000
+)
+
+// @Tags region
+// @Summary List regions with the highest write flow.
+// @Param limit query integer false "Limit count" default(16)
+// @Produce json
+// @Success 200 {object} RegionsInfo
+// @Failure 400 {string} string "The input is invalid."
+// @Router /regions/writeflow [get]
+func (h *regionsHandler) GetTopWriteFlow(w http.ResponseWriter, r *http.Request) {
+	h.GetTopNRegions(w, r, func(a, b *core.RegionInfo) bool { return a.GetBytesWritten() < b.GetBytesWritten() })
+}
+
+// @Tags region
+// @Summary List regions with the highest read flow.
+// @Param limit query integer false "Limit count" default(16)
+// @Produce json
+// @Success 200 {object} RegionsInfo
+// @Failure 400 {string} string "The input is invalid."
+// @Router /regions/readflow [get]
+func (h *regionsHandler) GetTopReadFlow(w http.ResponseWriter, r *http.Request) {
+	h.GetTopNRegions(w, r, func(a, b *core.RegionInfo) bool { return a.GetBytesRead() < b.GetBytesRead() })
+}
+
+// @Tags region
+// @Summary List regions with the largest conf version.
+// @Param limit query integer false "Limit count" default(16)
+// @Produce json
+// @Success 200 {object} RegionsInfo
+// @Failure 400 {string} string "The input is invalid."
+// @Router /regions/confver [get]
+func (h *regionsHandler) GetTopConfVer(w http.ResponseWriter, r *http.Request) {
+	h.GetTopNRegions(w, r, func(a, b *core.RegionInfo) bool {
+		return a.GetMeta().GetRegionEpoch().GetConfVer() < b.GetMeta().GetRegionEpoch().GetConfVer()
+	})
+}
+
+// @Tags region
+// @Summary List regions with the largest version.
+// @Param limit query integer false "Limit count" default(16)
+// @Produce json
+// @Success 200 {object} RegionsInfo
+// @Failure 400 {string} string "The input is invalid."
+// @Router /regions/version [get]
+func (h *regionsHandler) GetTopVersion(w http.ResponseWriter, r *http.Request) {
+	h.GetTopNRegions(w, r, func(a, b *core.RegionInfo) bool {
+		return a.GetMeta().GetRegionEpoch().GetVersion() < b.GetMeta().GetRegionEpoch().GetVersion()
+	})
+}
+
+// @Tags region
+// @Summary List regions with the largest size.
+// @Param limit query integer false "Limit count" default(16)
+// @Produce json
+// @Success 200 {object} RegionsInfo
+// @Failure 400 {string} string "The input is invalid."
+// @Router /regions/size [get]
+func (h *regionsHandler) GetTopSize(w http.ResponseWriter, r *http.Request) {
+	h.GetTopNRegions(w, r, func(a, b *core.RegionInfo) bool {
+		return a.GetApproximateSize() < b.GetApproximateSize()
+	})
+}
+
+func (h *regionsHandler) GetTopNRegions(w http.ResponseWriter, r *http.Request, less func(a, b *core.RegionInfo) bool) {
+	rc := getCluster(r.Context())
+	limit := defaultRegionLimit
+	if limitStr := r.URL.Query().Get("limit"); limitStr != "" {
+		var err error
+		limit, err = strconv.Atoi(limitStr)
+		if err != nil {
+			h.rd.JSON(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if limit > maxRegionLimit {
+		limit = maxRegionLimit
+	}
+	regions := TopNRegions(rc.GetRegions(), less, limit)
+	regionsInfo := convertToAPIRegions(regions)
+	h.rd.JSON(w, http.StatusOK, regionsInfo)
+}
+
+// RegionHeap implements heap.Interface, used for selecting top n regions.
+type RegionHeap struct {
+	regions []*core.RegionInfo
+	less    func(a, b *core.RegionInfo) bool
+}
+
+func (h *RegionHeap) Len() int           { return len(h.regions) }
+func (h *RegionHeap) Less(i, j int) bool { return h.less(h.regions[i], h.regions[j]) }
+func (h *RegionHeap) Swap(i, j int)      { h.regions[i], h.regions[j] = h.regions[j], h.regions[i] }
+
+// Push pushes an element x onto the heap.
+func (h *RegionHeap) Push(x interface{}) {
+	h.regions = append(h.regions, x.(*core.RegionInfo))
+}
+
+// Pop removes the minimum element (according to Less) from the heap and returns
+// it.
+func (h *RegionHeap) Pop() interface{} {
+	pos := len(h.regions) - 1
+	x := h.regions[pos]
+	h.regions = h.regions[:pos]
+	return x
+}
+
+// Min returns the minimum region from the heap.
+func (h *RegionHeap) Min() *core.RegionInfo {
+	if h.Len() == 0 {
+		return nil
+	}
+	return h.regions[0]
+}
+
+// TopNRegions returns top n regions according to the given rule.
+func TopNRegions(regions []*core.RegionInfo, less func(a, b *core.RegionInfo) bool, n int) []*core.RegionInfo {
+	if n <= 0 {
+		return nil
+	}
+
+	hp := &RegionHeap{
+		regions: make([]*core.RegionInfo, 0, n),
+		less:    less,
+	}
+	for _, r := range regions {
+		if hp.Len() < n {
+			heap.Push(hp, r)
+			continue
+		}
+		if less(hp.Min(), r) {
+			heap.Pop(hp)
+			heap.Push(hp, r)
+		}
+	}
+
+	res := make([]*core.RegionInfo, hp.Len())
+	for i := hp.Len() - 1; i >= 0; i-- {
+		res[i] = heap.Pop(hp).(*core.RegionInfo)
+	}
+	return res
 }

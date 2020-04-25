@@ -16,39 +16,6 @@ package server
 import "github.com/prometheus/client_golang/prometheus"
 
 var (
-	txnCounter = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Namespace: "pd",
-			Subsystem: "txn",
-			Name:      "txns_count",
-			Help:      "Counter of txns.",
-		}, []string{"result"})
-
-	txnDuration = prometheus.NewHistogramVec(
-		prometheus.HistogramOpts{
-			Namespace: "pd",
-			Subsystem: "txn",
-			Name:      "handle_txns_duration_seconds",
-			Help:      "Bucketed histogram of processing time (s) of handled txns.",
-			Buckets:   prometheus.ExponentialBuckets(0.0005, 2, 13),
-		}, []string{"result"})
-
-	operatorCounter = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
-			Namespace: "pd",
-			Subsystem: "schedule",
-			Name:      "operators_count",
-			Help:      "Counter of schedule operators.",
-		}, []string{"type", "event"})
-
-	clusterStatusGauge = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: "pd",
-			Subsystem: "cluster",
-			Name:      "status",
-			Help:      "Status of the cluster.",
-		}, []string{"type", "namespace"})
-
 	timeJumpBackCounter = prometheus.NewCounter(
 		prometheus.CounterOpts{
 			Namespace: "pd",
@@ -57,56 +24,54 @@ var (
 			Help:      "Counter of system time jumps backward.",
 		})
 
-	schedulerStatusGauge = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Namespace: "pd",
-			Subsystem: "scheduler",
-			Name:      "status",
-			Help:      "Status of the scheduler.",
-		}, []string{"kind", "type"})
-
 	regionHeartbeatCounter = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: "pd",
 			Subsystem: "scheduler",
 			Name:      "region_heartbeat",
 			Help:      "Counter of region hearbeat.",
-		}, []string{"store", "type", "status"})
+		}, []string{"address", "store", "type", "status"})
 
-	storeStatusGauge = prometheus.NewGaugeVec(
-		prometheus.GaugeOpts{
+	regionHeartbeatLatency = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
 			Namespace: "pd",
 			Subsystem: "scheduler",
-			Name:      "store_status",
-			Help:      "Store status for schedule",
-		}, []string{"namespace", "store", "type"})
+			Name:      "region_heartbeat_latency_seconds",
+			Help:      "Bucketed histogram of latency (s) of receiving heartbeat.",
+			Buckets:   prometheus.ExponentialBuckets(1, 2, 12),
+		}, []string{"address", "store"})
 
-	hotSpotStatusGauge = prometheus.NewGaugeVec(
+	metadataGauge = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: "pd",
-			Subsystem: "hotspot",
-			Name:      "status",
-			Help:      "Status of the hotspot.",
-		}, []string{"store", "type"})
+			Subsystem: "cluster",
+			Name:      "metadata",
+			Help:      "Record critical metadata.",
+		}, []string{"type"})
 
-	tsoCounter = prometheus.NewCounterVec(
-		prometheus.CounterOpts{
+	etcdStateGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
 			Namespace: "pd",
 			Subsystem: "server",
-			Name:      "tso",
-			Help:      "Counter of tso events",
+			Name:      "etcd_state",
+			Help:      "Etcd raft states.",
 		}, []string{"type"})
+
+	tsoHandleDuration = prometheus.NewHistogram(
+		prometheus.HistogramOpts{
+			Namespace: "pd",
+			Subsystem: "server",
+			Name:      "handle_tso_duration_seconds",
+			Help:      "Bucketed histogram of processing time (s) of handled tso requests.",
+			Buckets:   prometheus.ExponentialBuckets(0.0005, 2, 13),
+		})
 )
 
 func init() {
-	prometheus.MustRegister(txnCounter)
-	prometheus.MustRegister(txnDuration)
-	prometheus.MustRegister(operatorCounter)
-	prometheus.MustRegister(clusterStatusGauge)
 	prometheus.MustRegister(timeJumpBackCounter)
-	prometheus.MustRegister(schedulerStatusGauge)
 	prometheus.MustRegister(regionHeartbeatCounter)
-	prometheus.MustRegister(hotSpotStatusGauge)
-	prometheus.MustRegister(tsoCounter)
-	prometheus.MustRegister(storeStatusGauge)
+	prometheus.MustRegister(regionHeartbeatLatency)
+	prometheus.MustRegister(metadataGauge)
+	prometheus.MustRegister(etcdStateGauge)
+	prometheus.MustRegister(tsoHandleDuration)
 }

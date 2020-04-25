@@ -14,85 +14,35 @@
 package server
 
 import (
+	"context"
 	"fmt"
+	"io/ioutil"
+	"net/http"
 	"testing"
-	"time"
 
-	"github.com/coreos/etcd/clientv3"
 	. "github.com/pingcap/check"
-	"github.com/pingcap/pd/pkg/testutil"
-	log "github.com/sirupsen/logrus"
+	"github.com/pingcap/pd/v4/pkg/etcdutil"
+	"github.com/pingcap/pd/v4/pkg/testutil"
+	"github.com/pingcap/pd/v4/server/config"
+	"go.etcd.io/etcd/embed"
+	"go.etcd.io/etcd/pkg/types"
+	"go.uber.org/goleak"
 )
 
 func TestServer(t *testing.T) {
+	EnableZap = true
 	TestingT(t)
 }
 
-type cleanupFunc func()
-
-func newTestServer(c *C) (*Server, cleanUpFunc) {
-	cfg := NewTestSingleConfig()
-
-	svr, err := CreateServer(cfg, nil)
-	c.Assert(err, IsNil)
-
-	cleanup := func() {
-		svr.Close()
-		cleanServer(svr.cfg)
-	}
-
-	return svr, cleanup
-}
-
-func mustRunTestServer(c *C) (*Server, cleanUpFunc) {
-	server, cleanup := newTestServer(c)
-	err := server.Run()
-	c.Assert(err, IsNil)
-	mustWaitLeader(c, []*Server{server})
-	return server, cleanup
-}
-
-func newMultiTestServers(c *C, count int) ([]*Server, cleanupFunc) {
-	svrs := make([]*Server, 0, count)
-	cfgs := NewTestMultiConfig(count)
-
-	ch := make(chan *Server, count)
-	for _, cfg := range cfgs {
-		go func(cfg *Config) {
-			svr, err := CreateServer(cfg, nil)
-			c.Assert(err, IsNil)
-			err = svr.Run()
-			c.Assert(err, IsNil)
-			ch <- svr
-		}(cfg)
-	}
-
-	for i := 0; i < count; i++ {
-		svr := <-ch
-		svrs = append(svrs, svr)
-	}
-	close(ch)
-
-	mustWaitLeader(c, svrs)
-
-	cleanup := func() {
-		for _, svr := range svrs {
-			svr.Close()
-		}
-
-		for _, cfg := range cfgs {
-			cleanServer(cfg)
-		}
-	}
-
-	return svrs, cleanup
+func TestMain(m *testing.M) {
+	goleak.VerifyTestMain(m, testutil.LeakOptions...)
 }
 
 func mustWaitLeader(c *C, svrs []*Server) *Server {
 	var leader *Server
 	testutil.WaitUntil(c, func(c *C) bool {
 		for _, s := range svrs {
-			if s.IsLeader() {
+			if !s.IsClosed() && s.member.IsLeader() {
 				leader = s
 				return true
 			}
@@ -105,29 +55,24 @@ func mustWaitLeader(c *C, svrs []*Server) *Server {
 var _ = Suite(&testLeaderServerSuite{})
 
 type testLeaderServerSuite struct {
+	ctx        context.Context
+	cancel     context.CancelFunc
 	svrs       map[string]*Server
 	leaderPath string
 }
 
-func mustGetEtcdClient(c *C, svrs map[string]*Server) *clientv3.Client {
-	for _, svr := range svrs {
-		return svr.GetClient()
-	}
-	c.Fatal("etcd client none available")
-	return nil
-}
-
 func (s *testLeaderServerSuite) SetUpSuite(c *C) {
+	s.ctx, s.cancel = context.WithCancel(context.Background())
 	s.svrs = make(map[string]*Server)
 
-	cfgs := NewTestMultiConfig(3)
+	cfgs := NewTestMultiConfig(c, 3)
 
 	ch := make(chan *Server, 3)
 	for i := 0; i < 3; i++ {
 		cfg := cfgs[i]
 
 		go func() {
-			svr, err := CreateServer(cfg, nil)
+			svr, err := CreateServer(s.ctx, cfg)
 			c.Assert(err, IsNil)
 			err = svr.Run()
 			c.Assert(err, IsNil)
@@ -138,60 +83,49 @@ func (s *testLeaderServerSuite) SetUpSuite(c *C) {
 	for i := 0; i < 3; i++ {
 		svr := <-ch
 		s.svrs[svr.GetAddr()] = svr
-		s.leaderPath = svr.getLeaderPath()
+		s.leaderPath = svr.GetMember().GetLeaderPath()
 	}
 }
 
 func (s *testLeaderServerSuite) TearDownSuite(c *C) {
+	s.cancel()
 	for _, svr := range s.svrs {
 		svr.Close()
-		cleanServer(svr.cfg)
+		testutil.CleanServer(svr.cfg.DataDir)
 	}
-}
-
-func (s *testLeaderServerSuite) TestLeader(c *C) {
-	leader1 := mustGetLeader(c, mustGetEtcdClient(c, s.svrs), s.leaderPath)
-	svr, ok := s.svrs[getLeaderAddr(leader1)]
-	c.Assert(ok, IsTrue)
-	svr.Close()
-	delete(s.svrs, getLeaderAddr(leader1))
-
-	client := mustGetEtcdClient(c, s.svrs)
-
-	// wait leader changes
-	for i := 0; i < 50; i++ {
-		leader, _ := getLeader(client, s.leaderPath)
-		if leader != nil && getLeaderAddr(leader) != getLeaderAddr(leader1) {
-			break
-		}
-
-		time.Sleep(500 * time.Millisecond)
-	}
-
-	leader2 := mustGetLeader(c, client, s.leaderPath)
-	c.Assert(getLeaderAddr(leader1), Not(Equals), getLeaderAddr(leader2))
 }
 
 var _ = Suite(&testServerSuite{})
 
 type testServerSuite struct{}
 
-func newTestServersWithCfgs(c *C, cfgs []*Config) ([]*Server, cleanupFunc) {
+func newTestServersWithCfgs(ctx context.Context, c *C, cfgs []*config.Config) ([]*Server, CleanupFunc) {
 	svrs := make([]*Server, 0, len(cfgs))
 
 	ch := make(chan *Server)
 	for _, cfg := range cfgs {
-		go func(cfg *Config) {
-			svr, err := CreateServer(cfg, nil)
+		go func(cfg *config.Config) {
+			svr, err := CreateServer(ctx, cfg)
+			// prevent blocking if Asserts fails
+			failed := true
+			defer func() {
+				if failed {
+					ch <- nil
+				} else {
+					ch <- svr
+				}
+			}()
 			c.Assert(err, IsNil)
 			err = svr.Run()
 			c.Assert(err, IsNil)
-			ch <- svr
+			failed = false
 		}(cfg)
 	}
 
 	for i := 0; i < len(cfgs); i++ {
-		svrs = append(svrs, <-ch)
+		svr := <-ch
+		c.Assert(svr, NotNil)
+		svrs = append(svrs, svr)
 	}
 	mustWaitLeader(c, svrs)
 
@@ -200,85 +134,21 @@ func newTestServersWithCfgs(c *C, cfgs []*Config) ([]*Server, cleanupFunc) {
 			svr.Close()
 		}
 		for _, cfg := range cfgs {
-			cleanServer(cfg)
+			testutil.CleanServer(cfg.DataDir)
 		}
 	}
 
 	return svrs, cleanup
 }
 
-func (s *testServerSuite) TestClusterID(c *C) {
-	cfgs := NewTestMultiConfig(3)
-	for i, cfg := range cfgs {
-		cfg.DataDir = fmt.Sprintf("/tmp/test_pd_cluster_id_%d", i)
-		cleanServer(cfg)
-	}
-
-	svrs, cleanup := newTestServersWithCfgs(c, cfgs)
-
-	// All PDs should have the same cluster ID.
-	clusterID := svrs[0].clusterID
-	c.Assert(clusterID, Not(Equals), uint64(0))
-	for _, svr := range svrs {
-		log.Debug(svr.clusterID)
-		c.Assert(svr.clusterID, Equals, clusterID)
-	}
-
-	// Restart all PDs.
-	for _, svr := range svrs {
-		svr.Close()
-	}
-	svrs, cleanup = newTestServersWithCfgs(c, cfgs)
-	defer cleanup()
-
-	// All PDs should have the same cluster ID as before.
-	for _, svr := range svrs {
-		c.Assert(svr.clusterID, Equals, clusterID)
-	}
-}
-
-func (s *testServerSuite) TestUpdateAdvertiseUrls(c *C) {
-	cfgs := NewTestMultiConfig(2)
-	for i, cfg := range cfgs {
-		cfg.DataDir = fmt.Sprintf("/tmp/test_pd_advertise_%d", i)
-		cleanServer(cfg)
-	}
-
-	svrs, cleanup := newTestServersWithCfgs(c, cfgs)
-
-	// AdvertisePeerUrls should equals to PeerUrls
-	for _, svr := range svrs {
-		c.Assert(svr.cfg.AdvertisePeerUrls, Equals, svr.cfg.PeerUrls)
-		c.Assert(svr.cfg.AdvertiseClientUrls, Equals, svr.cfg.ClientUrls)
-	}
-
-	// Close all PDs.
-	for _, svr := range svrs {
-		svr.Close()
-	}
-
-	// Little malicious tweak.
-	overlapPeerURL := "," + testutil.AllocTestURL()
-	for _, cfg := range cfgs {
-		cfg.AdvertisePeerUrls += overlapPeerURL
-	}
-
-	// Restart all PDs.
-	svrs, cleanup = newTestServersWithCfgs(c, cfgs)
-	defer cleanup()
-
-	// All PDs should have the same advertise urls as before.
-	for _, svr := range svrs {
-		c.Assert(svr.cfg.AdvertisePeerUrls, Equals, svr.cfg.PeerUrls)
-	}
-}
-
 func (s *testServerSuite) TestCheckClusterID(c *C) {
-	cfgs := NewTestMultiConfig(2)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cfgs := NewTestMultiConfig(c, 2)
 	for i, cfg := range cfgs {
 		cfg.DataDir = fmt.Sprintf("/tmp/test_pd_check_clusterID_%d", i)
 		// Clean up before testing.
-		cleanServer(cfg)
+		testutil.CleanServer(cfg.DataDir)
 	}
 	originInitial := cfgs[0].InitialCluster
 	for _, cfg := range cfgs {
@@ -286,23 +156,73 @@ func (s *testServerSuite) TestCheckClusterID(c *C) {
 	}
 
 	cfgA, cfgB := cfgs[0], cfgs[1]
-	// Start a standalone cluster
-	// TODO: clean up. For now tests failed because:
-	//    etcdserver: failed to purge snap file ...
-	svrsA, _ := newTestServersWithCfgs(c, []*Config{cfgA})
+	// Start a standalone cluster.
+	svrsA, cleanA := newTestServersWithCfgs(ctx, c, []*config.Config{cfgA})
+	defer cleanA()
 	// Close it.
 	for _, svr := range svrsA {
 		svr.Close()
 	}
 
 	// Start another cluster.
-	_, cleanB := newTestServersWithCfgs(c, []*Config{cfgB})
+	_, cleanB := newTestServersWithCfgs(ctx, c, []*config.Config{cfgB})
 	defer cleanB()
 
-	// Start pervious cluster, expect an error.
+	// Start previous cluster, expect an error.
 	cfgA.InitialCluster = originInitial
-	svr, err := CreateServer(cfgA, nil)
+	svr, err := CreateServer(ctx, cfgA)
 	c.Assert(err, IsNil)
-	err = svr.Run()
+
+	etcd, err := embed.StartEtcd(svr.etcdCfg)
+	c.Assert(err, IsNil)
+	urlmap, err := types.NewURLsMap(svr.cfg.InitialCluster)
+	c.Assert(err, IsNil)
+	tlsConfig, err := svr.cfg.Security.ToTLSConfig()
+	c.Assert(err, IsNil)
+	err = etcdutil.CheckClusterID(etcd.Server.Cluster().ID(), urlmap, tlsConfig)
 	c.Assert(err, NotNil)
+	etcd.Close()
+	testutil.CleanServer(cfgA.DataDir)
+}
+
+var _ = Suite(&testServerHandlerSuite{})
+
+type testServerHandlerSuite struct{}
+
+func (s *testServerHandlerSuite) TestRegisterServerHandler(c *C) {
+	mokHandler := func(ctx context.Context, s *Server) (http.Handler, ServiceGroup, error) {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/pd/apis/mok/v1/hello", func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprintln(w, "Hello World")
+		})
+		info := ServiceGroup{
+			Name:    "mok",
+			Version: "v1",
+		}
+		return mux, info, nil
+	}
+	cfg := NewTestSingleConfig(c)
+	ctx, cancel := context.WithCancel(context.Background())
+	svr, err := CreateServer(ctx, cfg, mokHandler)
+	c.Assert(err, IsNil)
+	_, err = CreateServer(ctx, cfg, mokHandler, mokHandler)
+	// Repeat register.
+	c.Assert(err, NotNil)
+	defer func() {
+		cancel()
+		svr.Close()
+		testutil.CleanServer(svr.cfg.DataDir)
+	}()
+	err = svr.Run()
+	c.Assert(err, IsNil)
+	addr := fmt.Sprintf("%s/pd/apis/mok/v1/hello", svr.GetAddr())
+	resp, err := http.Get(addr)
+	c.Assert(err, IsNil)
+	c.Assert(resp.StatusCode, Equals, http.StatusOK)
+	c.Assert(err, IsNil)
+	defer resp.Body.Close()
+	bodyBytes, err := ioutil.ReadAll(resp.Body)
+	c.Assert(err, IsNil)
+	bodyString := string(bodyBytes)
+	c.Assert(bodyString, Equals, "Hello World\n")
 }
